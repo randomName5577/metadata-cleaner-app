@@ -1,26 +1,26 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile } from '@ffmpeg/util';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import './App.css';
 
 function App() {
   const [videoFile, setVideoFile] = useState(null);
   const [options, setOptions] = useState({
-    changeMetadata: { enabled: false, title: '', artist: '', album: '', year: '' },
-    changeVideoICC: { enabled: false },
-    changeExifData: { enabled: false },
-    changeMD5Hash: { enabled: false },
-    changeSaturation: { enabled: false, value: 1 },
-    randomSplits: { enabled: false, count: 2 },
-    trimVideoStart: { enabled: false, value: 0 },
-    trimVideoEnd: { enabled: false, value: 0 },
-    voiceChanger: { enabled: false, pitch: 0.9 },
-    changeHSLLightness: { enabled: false, value: -1 },
-    changeFrameRate: { enabled: false, value: 30 },
-    addSticker: { enabled: false, size: 10 },
-    changeAudioBitrate: { enabled: false, value: 128 },
-    changeVideoBitrate: { enabled: false, value: 1000 },
-    changeResolution: { enabled: false, width: 1280, height: 720 },
+    changeMetadata: { enabled: true, title: '', artist: '', album: '', year: '' },
+    changeVideoICC: { enabled: true },
+    changeExifData: { enabled: true },
+    changeMD5Hash: { enabled: true },
+    changeSaturation: { enabled: true, value: 1 },
+    randomSplits: { enabled: true, count: 2 },
+    trimVideoStart: { enabled: true, value: 0 },
+    trimVideoEnd: { enabled: true, value: 0 },
+    voiceChanger: { enabled: true, pitch: 0.9 },
+    changeHSLLightness: { enabled: true, value: 0 },
+    changeFrameRate: { enabled: true, value: 30 },
+    addSticker: { enabled: true, size: 10 },
+    changeAudioBitrate: { enabled: true, value: 128 },
+    changeVideoBitrate: { enabled: true, value: 1000 },
+    changeResolution: { enabled: true, width: 1080, height: 1920 },
   });
   const [ready, setReady] = useState(false);
   const [message, setMessage] = useState('');
@@ -32,7 +32,11 @@ function App() {
 
   const loadFFmpeg = async () => {
     const ffmpeg = ffmpegRef.current;
-    await ffmpeg.load();
+    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd'
+    await ffmpeg.load({
+      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+    });
     setReady(true);
   };
 
@@ -63,27 +67,49 @@ function App() {
     }));
   };
 
-  const getFileStats = (file) => {
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const arrayBuffer = e.target.result;
-        const stats = {
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          lastModified: new Date(file.lastModified).toISOString(),
-          byteLength: arrayBuffer.byteLength,
-        };
-        resolve(stats);
-      };
-      reader.readAsArrayBuffer(file);
-    });
+  const getFileStats = async (file) => {
+    const ffmpeg = ffmpegRef.current;
+    await ffmpeg.writeFile(file.name, await fetchFile(file));
+
+    await ffmpeg.exec(['-i', file.name, '-show_streams', '-show_format', '-of', 'json']);
+    const statsJson = await ffmpeg.readFile('out.json');
+    const stats = JSON.parse(new TextDecoder().decode(statsJson));
+
+    // Calculate additional metadata
+    const videoStream = stats.streams.find(s => s.codec_type === 'video');
+    const audioStream = stats.streams.find(s => s.codec_type === 'audio');
+
+    const metadata = {
+      filename: file.name,
+      filesize: file.size,
+      format: stats.format.format_name,
+      duration: parseFloat(stats.format.duration).toFixed(2) + ' seconds',
+      bitrate: parseInt(stats.format.bit_rate) / 1000 + ' kbps',
+      videoCodec: videoStream?.codec_name,
+      resolution: `${videoStream?.width}x${videoStream?.height}`,
+      aspectRatio: videoStream?.display_aspect_ratio,
+      frameRate: parseFloat(videoStream?.r_frame_rate).toFixed(2),
+      videoBitrate: videoStream?.bit_rate ? parseInt(videoStream.bit_rate) / 1000 + ' kbps' : 'N/A',
+      audioCodec: audioStream?.codec_name,
+      sampleRate: audioStream?.sample_rate + ' Hz',
+      channels: audioStream?.channels,
+      audioBitrate: audioStream?.bit_rate ? parseInt(audioStream.bit_rate) / 1000 + ' kbps' : 'N/A',
+      iccProfile: stats.format.tags?.icc_profile || 'Not available',
+      exifData: JSON.stringify(stats.format.tags || {}, null, 2),
+    };
+
+    // Calculate MD5 hash
+    await ffmpeg.exec(['-i', file.name, '-f', 'md5', '-']);
+    const md5Hash = await ffmpeg.readFile('out.md5');
+    metadata.md5Hash = new TextDecoder().decode(md5Hash).trim();
+
+    return metadata;
   };
 
   const getVideoStats = async (ffmpeg, fileName) => {
-    const result = await ffmpeg.exec(['-i', fileName, '-show_streams', '-show_format', '-of', 'json']);
-    return ffmpeg.readFile('out.json', { encoding: 'utf8' });
+    await ffmpeg.exec(['-i', fileName, '-show_streams', '-show_format', '-of', 'json']);
+    const statsJson = await ffmpeg.readFile('out.json');
+    return new TextDecoder().decode(statsJson);
   };
 
   const processVideo = async () => {
@@ -120,7 +146,8 @@ function App() {
     }
 
     if (options.trimVideoStart.enabled || options.trimVideoEnd.enabled) {
-      const duration = parseFloat((await ffmpeg.exec(['-i', inputFileName, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0'])).split('\n')[0]);
+      const durationResult = await ffmpeg.exec(['-i', inputFileName, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0']);
+      const duration = parseFloat(new TextDecoder().decode(durationResult).split('\n')[0]);
       
       if (options.trimVideoStart.enabled) {
         inputOptions += ` -ss ${options.trimVideoStart.value}`;
@@ -154,7 +181,8 @@ function App() {
     }
 
     if (options.randomSplits.enabled) {
-      const duration = parseFloat((await ffmpeg.exec(['-i', inputFileName, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0'])).split('\n')[0]);
+      const durationResult = await ffmpeg.exec(['-i', inputFileName, '-show_entries', 'format=duration', '-v', 'quiet', '-of', 'csv=p=0']);
+      const duration = parseFloat(new TextDecoder().decode(durationResult).split('\n')[0]);
       const splitPoints = Array.from({length: options.randomSplits.count - 1}, () => Math.random() * duration).sort((a, b) => a - b);
       
       let splitCommand = `-i ${inputFileName} ${inputOptions} ${filterComplex}`;
@@ -164,6 +192,7 @@ function App() {
       splitCommand += ` -t ${duration} -c copy split_${options.randomSplits.count - 1}.mp4`;
       
       await ffmpeg.exec(splitCommand.split(' '));
+      setMessage('Video processing complete. Multiple split files have been created.');
       return;
     }
 
@@ -190,6 +219,10 @@ function App() {
     a.click();
     document.body.removeChild(a);
   };
+
+  const renderTooltip = (text) => (
+    <span className="tooltip" title={text}>?</span>
+  );
 
   return (
     <div className="App">
@@ -226,6 +259,7 @@ function App() {
                 />
                 {option.replace(/([A-Z])/g, ' $1').replace(/^./, (str) => str.toUpperCase())}
               </label>
+              {renderTooltip(getTooltipText(option))}
               {option === 'changeMetadata' && value.enabled && (
                 <div className="metadata-inputs">
                   <input
@@ -314,6 +348,27 @@ function App() {
       </main>
     </div>
   );
+}
+
+function getTooltipText(option) {
+  const tooltips = {
+    changeMetadata: "Change the video's metadata (title, artist, album, year)",
+    changeVideoICC: "Modify the video's ICC (International Color Consortium) profile",
+    changeExifData: "Alter the EXIF (Exchangeable Image File Format) data",
+    changeMD5Hash: "Change the MD5 hash of the video file",
+    changeSaturation: "Adjust the color saturation of the video (0-3, 1 is normal)",
+    randomSplits: "Split the video into random segments",
+    trimVideoStart: "Trim seconds from the start of the video",
+    trimVideoEnd: "Trim seconds from the end of the video",
+    voiceChanger: "Change the pitch of the audio (0.5-2, 1 is normal)",
+    changeHSLLightness: "Adjust the lightness of the video (-100 to 100, 0 is normal)",
+    changeFrameRate: "Change the frame rate of the video (fps)",
+    addSticker: "Add a white square sticker to the video (size in pixels)",
+    changeAudioBitrate: "Change the audio bitrate (kbps)",
+    changeVideoBitrate: "Change the video bitrate (kbps)",
+    changeResolution: "Change the resolution of the video (width x height in pixels)"
+  };
+  return tooltips[option] || "No description available";
 }
 
 export default App;
